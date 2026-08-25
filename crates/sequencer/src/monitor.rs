@@ -269,7 +269,7 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
         let mut fallback = tokio::time::interval(self.config.poll_interval);
 
         loop {
-            // NOTE: jtcn 63: Checks new Zone blocks for BatchFinalized events that are ready for L1.
+            // NOTE: jtcn 65: Checks new Zone blocks for BatchFinalized events that are ready for L1.
             self.process_available_blocks(shutdown).await;
 
             tokio::select! {
@@ -309,7 +309,7 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
             return;
         }
 
-        // NOTE: jtcn 64: Processes every Zone block after the last checked block through the new
+        // NOTE: jtcn 66: Processes every Zone block after the last checked block through the new
         // chain head.
         match self
             .process_block_range(scan_from, latest_zone_block, shutdown)
@@ -442,7 +442,7 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
                 "Submitting finalized zone batch"
             );
             let before_submit = self.last_submitted_zone_block;
-            // NOTE: jtcn 65: Builds the L1 batch data for every finalized boundary in order.
+            // NOTE: jtcn 67: Builds the L1 batch data for every finalized boundary in order.
             self.process_finalized_batch(range_start, boundary, shutdown)
                 .await?;
             if self.last_submitted_zone_block < boundary_block {
@@ -494,7 +494,7 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
             withdrawal_batch_index: finalized_batch.finalized_index,
         };
 
-        // NOTE: jtcn 66: The shadow prover checks the batch without blocking submission. The
+        // NOTE: jtcn 68: The shadow prover checks the batch without blocking submission. The
         // `collect_leader_settlements` task handles signatures separately.
         if let Some(prover) = &self.shadow_prover {
             prover.try_enqueue(from, to, batch_data.clone());
@@ -573,7 +573,7 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
             }
 
             let submit_started = std::time::Instant::now();
-            // NOTE: jtcn 72: Waits for enough signatures, ties the batch to a recent L1 block, and
+            // NOTE: jtcn 74: Waits for enough signatures, ties the batch to a recent L1 block, and
             // calls submitBatch on the Zone portal.
             match self
                 .batch_submitter
@@ -610,7 +610,7 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
                         .withdrawals_per_batch
                         .record(withdrawals.len() as f64);
 
-                    // NOTE: jtcn 73: Marks the batch submitted locally only after the L1 portal
+                    // NOTE: jtcn 84: Marks the batch submitted locally only after the L1 portal
                     // accepts it.
                     // Only advance local state on success.
                     self.prev_zone_block_hash = batch_data.next_block_hash;
@@ -622,7 +622,7 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
                         .set(last_zone_block as f64);
                     self.update_submission_lag();
 
-                    // NOTE: jtcn 74: Saves the full withdrawals under the portal queue slot, then
+                    // NOTE: jtcn 85: Saves the full withdrawals under the portal queue slot, then
                     // wakes `WithdrawalProcessor::run` to process them on L1.
                     // Store withdrawals under the logical portal queue index assigned on-chain.
                     if let Some(portal_index) = portal_index {
@@ -723,7 +723,7 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
     /// Returns the portal-confirmed canonical Zone block number. Callers must verify that this
     /// anchor covers any batch boundary they were attempting to submit.
     async fn resync_from_portal(&mut self) -> Result<u64> {
-        // NOTE: jtcn 75: After a failed or uncertain submission, reads the portal and resumes from
+        // NOTE: jtcn 86: After a failed or uncertain submission, reads the portal and resumes from
         // the last Zone block it actually accepted.
         self.metrics.resync_from_portal_total.increment(1);
         let old_hash = self.prev_zone_block_hash;
@@ -771,6 +771,8 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
             store.remove_submitted(last_submitted_zone_block);
         }
 
+        // NOTE: jtcn 87: The batch chapter is complete. The leader found each boundary, collected
+        // quorum signatures, submitted it to the portal, and resynced if the result was uncertain.
         Ok(last_submitted_zone_block)
     }
 
@@ -896,7 +898,7 @@ pub(crate) fn spawn_zone_monitor<P: ZoneSequencerProvider>(
                 }
             };
 
-            // NOTE: jtcn 62: A new Zone block wakes the monitor immediately. The poll interval is
+            // NOTE: jtcn 64: A new Zone block wakes the monitor immediately. The poll interval is
             // only a fallback.
             match monitor.run(&shutdown).await {
                 Ok(()) => {

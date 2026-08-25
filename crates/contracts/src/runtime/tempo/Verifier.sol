@@ -27,7 +27,7 @@ contract Verifier is IVerifier {
         override
         returns (bool)
     {
-        // NOTE: jtcn 95: This reference verifier is only a stub and accepts every proof. The
+        // NOTE: jtcn 81: This reference verifier is only a stub and accepts every proof. The
         // portal and sequencer signature checks still run, but this does not verify execution.
         return true;
     }

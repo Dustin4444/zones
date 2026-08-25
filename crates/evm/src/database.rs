@@ -140,7 +140,6 @@ impl<DB: Database, L1: L1StorageReader> RevmDatabase for L1OverlayDB<DB, L1> {
 
         // NOTE: jtcn 42: Sends TIP 403 storage reads to the L1 state provider using the recorded
         // L1 block number.
-        // NOTE: jtcn 43: The provider uses its cache first, then reads that exact L1 block by RPC.
         let anchor = self.anchor()?;
         // REVM already charges this TIP-403 SLOAD; the host-side L1 fetch must not be charged again.
         self.l1

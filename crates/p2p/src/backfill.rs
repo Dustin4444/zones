@@ -331,6 +331,8 @@ where
         }
         attempts.push(candidates);
 
+        // NOTE: jtcn 56: Asks the current leader first, then other quorum peers. Each peer gets at
+        // most one open request and any node can serve blocks whether it is leader or follower.
         // When a usable leader exists, `attempts` contains a leader-only pass followed
         // by a pass over all eligible peers. If there's no leader, then go to the peers directly.
         // The job prevents a peer from receiving duplicate requests while an earlier response

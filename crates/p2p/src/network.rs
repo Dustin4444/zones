@@ -134,9 +134,8 @@ fn peer_sets(
                 node.address().to_commonware(),
             )
         })
-        // RPC-only nodes initiate their own replication connections. Quorum members retain the
-        // RPC-only members as secondary peers so their inbound connection is authenticated, but
-        // they never create reverse P2P dials into the public RPC environment.
+        // NOTE: jtcn 18: Every node connects to the quorum nodes. RPC nodes make the connection
+        // themselves, so quorum nodes never connect back into RPC nodes.
         .partition(|(rpc_only, public_key, _)| !rpc_only || public_key == local_ed25519_public_key);
     let primary = Map::try_from(
         primary
@@ -156,9 +155,8 @@ fn peer_sets(
 }
 
 fn namespace(zone_id: u32, network_id: P2pNetworkId) -> Vec<u8> {
-    // The protocol version and immutable L1 deployment identity keep keys or endpoints
-    // accidentally reused across local, test, and production environments from authenticating
-    // into one another's network.
+    // The protocol version, L1 chain, portal, and Zone ID keep separate deployments from
+    // connecting to each other.
     let mut namespace = Vec::with_capacity(
         NETWORK_NAMESPACE_PREFIX.len() + 1 + 8 + EthereumAddress::len_bytes() + 4,
     );

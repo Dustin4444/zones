@@ -331,7 +331,7 @@ contract ZonePortal is IZonePortal {
         external
         onlyAdmin
     {
-        // NOTE: jtcn 83: Replaces the sequencers allowed to lead and sign batches, and sets how
+        // NOTE: jtcn 98: Replaces the sequencers allowed to lead and sign batches, and sets how
         // many signatures a batch needs.
         _replaceSequencerSet(newSequencers, newThreshold, true);
     }
@@ -413,7 +413,7 @@ contract ZonePortal is IZonePortal {
 
     /// @inheritdoc IZonePortal
     function setLeader(address newLeader, uint64 expectedEpoch) external onlySequencerOrAdmin {
-        // NOTE: jtcn 84: Changes the active leader once for this L1 block. The expected epoch stops
+        // NOTE: jtcn 99: Changes the active leader once for this L1 block. The expected epoch stops
         // an old request from changing it back later.
         if (!isSequencer(newLeader)) revert InvalidLeader();
         // Idempotent fanout: every node relays the same target, only the first call transitions.
@@ -769,7 +769,7 @@ contract ZonePortal is IZonePortal {
         external
         onlySequencerOrAdmin
     {
-        // NOTE: jtcn 85: Verifies the operator owns this decryption key, then adds it to key
+        // NOTE: jtcn 26: Verifies the operator owns this decryption key, then adds it to key
         // history. The previous key stays valid for the grace period.
         // Validate yParity
         if (!Secp256k1Lib.isCompressedYParity(yParity)) revert InvalidEphemeralPubkey();
@@ -1003,7 +1003,7 @@ contract ZonePortal is IZonePortal {
         internal
         returns (bytes32 newCurrentDepositQueueHash)
     {
-        // NOTE: jtcn 86: Checks the depositor, token, refund address, TIP 403 policy, encrypted
+        // NOTE: jtcn 27: Checks the depositor, token, refund address, TIP 403 policy, encrypted
         // payload, and selected decryption key before taking funds.
         if (tempoRefundRecipient == address(0)) revert InvalidBouncebackRecipient();
         // Enforced gateways may deposit callback returns without also being allowed accounts.
@@ -1046,7 +1046,7 @@ contract ZonePortal is IZonePortal {
             revert EncryptionKeyExpired(keyIndex, key.activationBlock, nextKey.activationBlock);
         }
 
-        // NOTE: jtcn 87: Pulls the tokens into the portal, pays the deposit fee, and keeps the rest
+        // NOTE: jtcn 28: Pulls the tokens into the portal, pays the deposit fee, and keeps the rest
         // for the Zone recipient.
         (uint128 fee, uint128 netAmount) = _collectDepositFunds(_token, amount);
 
@@ -1060,7 +1060,7 @@ contract ZonePortal is IZonePortal {
             encrypted: encrypted
         });
 
-        // NOTE: jtcn 88: Adds the encrypted deposit to the hash queue. The L1 subscriber reads
+        // NOTE: jtcn 29: Adds the encrypted deposit to the hash queue. The L1 subscriber reads
         // this event and sends the deposit into the next Zone block.
         // Insert the deposit into the queue.
         newCurrentDepositQueueHash =
@@ -1103,7 +1103,7 @@ contract ZonePortal is IZonePortal {
         whenNotPaused
         nonReentrantWithdrawal
     {
-        // NOTE: jtcn 98: Rebuilds the withdrawal hash chain so each item can be checked and
+        // NOTE: jtcn 93: Rebuilds the withdrawal hash chain so each item can be checked and
         // removed from the portal queue in order.
         bytes32[] memory remainingQueues = new bytes32[](withdrawals.length);
         bytes32 nextQueue = remainingQueue;
@@ -1116,10 +1116,13 @@ contract ZonePortal is IZonePortal {
         for (uint256 i; i < withdrawals.length; ++i) {
             _processWithdrawal(withdrawals[i], remainingQueues[i]);
         }
+
+        // NOTE: jtcn 97: The withdrawal chapter is complete. The portal checked and sent each item
+        // in order, and any failed send became a Zone deposit instead of blocking the queue.
     }
 
     function _processWithdrawal(Withdrawal calldata withdrawal, bytes32 remainingQueue) internal {
-        // NOTE: jtcn 99: Removes the withdrawal from the queue, then sends it. A failed transfer or
+        // NOTE: jtcn 94: Removes the withdrawal from the queue, then sends it. A failed transfer or
         // callback is turned into a deposit back to the Zone instead of blocking the queue.
         // Pop from withdrawal queue (library handles swap and hash verification)
         _withdrawalQueue.dequeue(withdrawal, remainingQueue);
@@ -1319,12 +1322,12 @@ contract ZonePortal is IZonePortal {
         external
         onlySequencer
     {
-        // NOTE: jtcn 89: A batch must start from the last Zone block this portal accepted.
+        // NOTE: jtcn 75: A batch must start from the last Zone block this portal accepted.
         if (blockTransition.prevBlockHash != blockHash) {
             revert InvalidProof();
         }
 
-        // NOTE: jtcn 90: Gets the L1 block hash this batch is tied to. Recent batches use their L1
+        // NOTE: jtcn 76: Gets the L1 block hash this batch is tied to. Recent batches use their L1
         // block directly, while older batches include a newer block for the ancestry proof.
         // Determine anchor block: either tempoBlockNumber (direct) or recentTempoBlockNumber (ancestry)
         uint64 anchorBlockNumber;
@@ -1353,7 +1356,7 @@ contract ZonePortal is IZonePortal {
 
         if (anchorBlockHash == bytes32(0)) revert InvalidTempoBlockNumber();
 
-        // NOTE: jtcn 91: Checks enough current sequencers signed this exact batch and L1 anchor.
+        // NOTE: jtcn 77: Checks enough current sequencers signed this exact batch and L1 anchor.
         // The certificate binds every value that affects settlement, rather than only the
         // zone block hash. A leader therefore cannot reuse signatures for this block with a
         // different withdrawal root, deposit transition, Tempo anchor, or verifier config.
@@ -1369,7 +1372,7 @@ contract ZonePortal is IZonePortal {
                 signatures
             )) revert InvalidQuorumCertificate();
 
-        // NOTE: jtcn 93: Checks deposit processing continues from the last accepted deposit and
+        // NOTE: jtcn 79: Checks deposit processing continues from the last accepted deposit and
         // never moves backward or past the end of the queue.
         // These are strictly not necessary, but we'll assert them here since they are cheap while
         // the prover doesn't (yet) enforce them.
@@ -1385,7 +1388,7 @@ contract ZonePortal is IZonePortal {
             revert InvalidDepositTransition();
         }
 
-        // NOTE: jtcn 94: Passes the block, deposit, and withdrawal changes to the configured proof
+        // NOTE: jtcn 80: Passes the block, deposit, and withdrawal changes to the configured proof
         // verifier before accepting the batch.
         // Verify proof (handles both direct and ancestry modes)
         bool valid = IVerifier(verifier)
@@ -1403,7 +1406,7 @@ contract ZonePortal is IZonePortal {
             );
         if (!valid) revert InvalidProof();
 
-        // NOTE: jtcn 96: Saves the new Zone block hash, L1 checkpoint, deposit position, batch
+        // NOTE: jtcn 82: Saves the new Zone block hash, L1 checkpoint, deposit position, batch
         // number, and Zone height after every check passes.
         // Update state
         withdrawalBatchIndex++;
@@ -1412,7 +1415,7 @@ contract ZonePortal is IZonePortal {
         lastProcessedDepositNumber = depositQueueTransition.nextDepositNumber;
         zoneHeight = nextZoneHeight;
 
-        // NOTE: jtcn 97: Adds this batch's withdrawal hash to the portal queue. Empty withdrawal
+        // NOTE: jtcn 83: Adds this batch's withdrawal hash to the portal queue. Empty withdrawal
         // batches do not take a queue slot.
         uint256 assignedQueueIndex = _withdrawalQueue.enqueue(withdrawalQueueHash);
 
@@ -1442,7 +1445,7 @@ contract ZonePortal is IZonePortal {
         view
         returns (bool)
     {
-        // NOTE: jtcn 92: Requires the signing threshold, rejects unknown or duplicate signers,
+        // NOTE: jtcn 78: Requires the signing threshold, rejects unknown or duplicate signers,
         // and checks every signature covers the same batch data.
         uint256 threshold = sequencerThreshold;
         if (

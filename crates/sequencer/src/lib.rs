@@ -199,7 +199,7 @@ pub async fn spawn_zone_sequencer<P: ZoneSequencerProvider>(
         withdrawal_notify,
         withdrawal_repair_notify,
     );
-    // NOTE: jtcn 61: Starts the monitor from the last Zone block accepted by the L1 portal so a
+    // NOTE: jtcn 63: Starts the monitor from the last Zone block accepted by the L1 portal so a
     // restart does not repeat or skip batches.
     let monitor_handle = monitor::spawn_zone_monitor(
         monitor_config,

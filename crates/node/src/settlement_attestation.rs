@@ -544,7 +544,7 @@ where
     P: HeaderProvider<Header = TempoHeader> + ReceiptProvider,
 {
     scan_settlement_range(start, end, |candidate| {
-        // NOTE: jtcn 67: At a saved batch boundary, the leader rebuilds the batch from local Zone
+        // NOTE: jtcn 69: At a saved batch boundary, the leader rebuilds the batch from local Zone
         // state and signs it first.
         propose_settlement(provider, candidate, commands, context)
     })
@@ -596,7 +596,7 @@ where
     let (_, signatures) = context
         .store
         .insert_settlement(context.domain, signer, signed);
-    // NOTE: jtcn 68: Sends the batch through P2P. Followers handle it in
+    // NOTE: jtcn 70: Sends the batch through P2P. Followers handle it in
     // `run_follower_block_sync`.
     commands
         .send(P2pCommand::BroadcastSettlementProposal(

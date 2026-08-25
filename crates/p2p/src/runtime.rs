@@ -390,10 +390,8 @@ fn run(
     commonware_runtime::tokio::Runner::new(runtime_config).start(|context| async move {
         let local_ed25519_public_key = config.ed25519_public_key();
         let leadership = config.leadership();
-        // NOTE: jtcn 17: Builds a network name from the protocol, L1, portal, and Zone ID, then
-        // loads the peers trusted by the manifest.
-        // NOTE: jtcn 18: RPC nodes connect to quorum nodes. Quorum nodes do not connect back to
-        // RPC nodes.
+        // NOTE: jtcn 17: Starts this Zone's Commonware network. This loads the manifest peers and
+        // returns the network used to create each P2P channel below.
         let (mut commonware, mut oracle, peers) = network::instantiate(
             &context,
             &config.manifest,
@@ -464,8 +462,6 @@ fn run(
         // send each type of P2P message.
         let membership = RoutingMembership::from_manifest(&config.manifest);
 
-        // NOTE: jtcn 21: Checks those permissions before sending blocks, transactions, or
-        // settlement messages to peers.
         let command_loop = run_commands(
             local_ed25519_public_key.clone(),
             membership.clone(),
@@ -480,7 +476,6 @@ fn run(
         );
         tokio::pin!(command_loop);
 
-        // NOTE: jtcn 22: Verifies who sent each received message and whether they can send it now.
         let receive_loop = run_receivers(
             local_ed25519_public_key.clone(),
             membership.clone(),
@@ -540,9 +535,13 @@ async fn run_commands(
     mut senders: P2pSenders,
     mut commands: mpsc::Receiver<P2pCommand>,
 ) -> eyre::Result<()> {
+    // NOTE: jtcn 21: Node tasks put outbound messages on `P2pHandle.commands`. Each branch checks
+    // this node's role, picks the manifest peers, and uses its Commonware channel from above.
     while let Some(command) = commands.recv().await {
         match command {
             P2pCommand::BroadcastBlock(block) => {
+                // NOTE: jtcn 52: Confirms this node can broadcast blocks, then sends the saved
+                // block to every other manifest peer on the block channel.
                 // Mirror of the inbound transport check: the sender must lead somewhere in
                 // the retained schedule; every importer applies the exact
                 // `producer == leader_for(anchor)` fence. Recipients are all other manifest
@@ -711,6 +710,8 @@ where
         mut transactions,
     } = receivers;
 
+    // NOTE: jtcn 22: Commonware gives this loop each message and the authenticated manifest peer
+    // that sent it. This checks the peer can send that message now, then passes it to the node.
     loop {
         let event = tokio::select! {
             // Got a block

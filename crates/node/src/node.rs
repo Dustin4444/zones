@@ -900,6 +900,9 @@ where
             .await?;
         }
 
+        // NOTE: jtcn 14: Node startup is done. It built the Reth node, checked the Zone against L1,
+        // loaded tokens, keys, and leadership, then started L1 sync, P2P, both RPC servers, and
+        // leader or follower work. Next is how P2P moves data between nodes.
         Ok(handle)
     }
 }
@@ -938,6 +941,8 @@ impl LeadershipSink for ScheduleLeadershipSink {
                 transition.epoch,
             )
         })?;
+        // NOTE: jtcn 100: Maps the finalized portal leader address to its manifest P2P identity,
+        // then publishes the epoch and the L1 block where that leader takes over.
         self.schedule.publish(LeadershipState::new(
             transition.epoch,
             leader.clone(),
@@ -1025,6 +1030,8 @@ where
             .increment(1);
         return Ok(());
     }
+    // NOTE: jtcn 106: Forced recovery starts a replacement leader after a canonical Zone block
+    // selected by the operator. The next finalized portal leader update ends the override.
     schedule.install_forced_recovery(
         recovery_epoch,
         recovery.leader().clone(),
@@ -1146,7 +1153,6 @@ where
         tokio::sync::mpsc::Sender<zone_p2p::P2pCommand>,
         tokio::sync::mpsc::Sender<BackfillCommand>,
     )> {
-        // NOTE: jtcn 14: Starts P2P and returns the channels the node uses to talk to it.
         let handle = spawn_p2p(config, network_id)?;
         let zone_p2p::P2pHandleParts {
             shutdown: shutdown_token,
@@ -1158,7 +1164,9 @@ where
         } = handle.into_parts();
 
         let sinks = EventSinks::default();
-        // NOTE: jtcn 23: Sends each P2P event to the leader or follower task running right now.
+        // NOTE: jtcn 23: P2P is fully wired. Peers are connected, outbound messages are checked,
+        // and inbound senders are authenticated. This router hands accepted messages to the current
+        // role. Next is the normal leader block path.
         task_executor.spawn_critical_task(
             "zone-p2p-event-router",
             route_events_to_generations(events, sinks.clone()),
