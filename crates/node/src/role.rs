@@ -119,7 +119,7 @@ pub(crate) struct LeaderSequencerDeps {
     pub prover_config: Option<ShadowProverConfig>,
 }
 
-/// Sinks for the long-lived P2P event demultiplexer.
+/// Sinks for the P2P event router.
 ///
 /// Role generations receive typed substreams, so dropping one generation never drops the
 /// underlying network event stream.
@@ -173,12 +173,12 @@ impl EventSinks {
     }
 }
 
-/// Long-lived P2P event demultiplexer for non-backfill protocols.
+/// Routes P2P events to the current role tasks.
 ///
 /// It owns the generic event receiver for the process lifetime and forwards events to the active
 /// generation's substream. Events arriving between generations are dropped because the successor
-/// re-derives its state from the provider and schedule. Generation delivery is deliberately
-/// non-blocking so a slow generation cannot block process-lifetime protocol work.
+/// rebuilds its state from the provider and schedule. This router does not wait for a slow role
+/// task.
 pub(crate) async fn route_events_to_generations(
     mut events: mpsc::Receiver<P2pEvent>,
     sinks: EventSinks,
@@ -194,7 +194,7 @@ pub(crate) async fn route_events_to_generations(
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
                 // Live blocks are recovered by the follower's periodic backfill probe, and
-                // transaction forwarding reconciles from the pool. Keep this router non-blocking.
+                // transaction forwarding reconciles from the pool. Do not block this router.
                 metrics::counter!("zone_leadership_events_dropped_backpressure_total").increment(1);
                 debug!(
                     target: "zone::role",
@@ -609,13 +609,11 @@ where
 
 /// Run the role controller until the process shuts down.
 ///
-/// `sinks` must be the same [`EventSinks`] handed to [`route_events_to_generations`] — the
-/// router is long-lived while generations come and go.
+/// `sinks` must be the same [`EventSinks`] handed to [`route_events_to_generations`]. The router
+/// stays running while role tasks change.
 ///
-/// Subscribes to schedule notifications plus generation task completion, re-derives the desired
-/// role by the next-anchor rule, and switches role generations.
-/// Observation alone never switches roles — the trigger is consumption progress reaching
-/// the boundary, which this loop tracks by re-reading the local Tempo checkpoint.
+/// Watches the leadership schedule and the current role task, then switches tasks when the local
+/// Tempo checkpoint reaches the handoff block.
 pub(crate) async fn run_role_controller<P, Pool>(
     context: RoleControllerContext<P, Pool>,
     sinks: EventSinks,
@@ -639,6 +637,8 @@ pub(crate) async fn run_role_controller<P, Pool>(
     let mut current: Option<RunningGeneration> = None;
 
     loop {
+        // NOTE: jtcn 24: Reads who should lead the next L1 block and runs this node as leader,
+        // follower, or fenced.
         // An rpc-only member is not registered with `ZonePortal`, so it can never be named
         // leader by a finalized transition. Fencing it explicitly means a corrupt or wrongly
         // provisioned record cannot start a producer whose blocks nobody could settle.
@@ -698,6 +698,7 @@ pub(crate) async fn run_role_controller<P, Pool>(
             .as_ref()
             .is_some_and(|generation| generation.role.same_variant(desired))
         {
+            // NOTE: jtcn 25: Stops the old role at the handoff block before starting the new role.
             if !stop_current_generation(&mut current, &sinks).await {
                 return;
             }
@@ -873,6 +874,8 @@ where
 
     match desired {
         DesiredRole::Fenced => {
+            // NOTE: jtcn 26: Fenced means no valid leader is known, so this node does not build or
+            // import blocks.
             sinks.clear();
             warn!(
                 target: "zone::role",
@@ -881,6 +884,8 @@ where
             );
         }
         DesiredRole::Follower { epoch } => {
+            // NOTE: jtcn 27: A follower imports leader blocks, asks for missing blocks, and
+            // forwards transactions. It never builds Zone blocks.
             let (sync_tx, sync_rx) = mpsc::channel(GENERATION_EVENT_BACKLOG);
             let (transactions_tx, transactions_rx) = mpsc::channel(GENERATION_EVENT_BACKLOG);
             let (backfill_tx, backfill_rx) = mpsc::channel(GENERATION_EVENT_BACKLOG);
@@ -928,6 +933,8 @@ where
             tasks.spawn(async move {
                 tokio::select! {
                     () = forward_token.cancelled() => TaskEnd::Ended("transaction-forwarding (cancelled)"),
+                    // NOTE: jtcn 59: Sends local transactions to the current and possible next
+                    // leaders so they are not lost during a handoff.
                     () = forward_new_transactions(pool, listener, commands) => {
                         TaskEnd::Ended("transaction-forwarding")
                     }
@@ -950,6 +957,8 @@ where
             info!(target: "zone::role", generation = id, epoch, "Follower generation started");
         }
         DesiredRole::Leader { epoch, .. } => {
+            // NOTE: jtcn 28: A leader builds and broadcasts Zone blocks, signs and submits batches,
+            // and processes withdrawals.
             let sequencer = context
                 .sequencer
                 .as_ref()
@@ -1012,6 +1021,7 @@ where
             let provider = context.provider.clone();
             let commands = context.commands.clone();
             tasks.spawn(async move {
+                // NOTE: jtcn 50: Broadcasts only Zone blocks already written to disk.
                 broadcast_persisted_blocks(provider, commands, broadcaster_rx).await;
                 TaskEnd::Ended("block-broadcast")
             });
@@ -1072,6 +1082,8 @@ where
             let prover_config = sequencer.prover_config.clone();
             let sequencer_token = token.clone();
             tasks.spawn(async move {
+                // NOTE: jtcn 60: Starts the batch monitor and withdrawal processor with the same
+                // L1 signer, nonce tracker, and withdrawal data.
                 let handle = spawn_zone_sequencer(
                     sequencer_config,
                     signer,

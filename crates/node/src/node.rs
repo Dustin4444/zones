@@ -626,7 +626,7 @@ where
 
         let task_executor = ctx.node.task_executor().clone();
         // NOTE: jtcn 9: Start P2P networking so nodes can share blocks and coordinate leadership.
-        // Start the Commonware network and the long-lived event router
+        // Start the Commonware network and the event router
         let sequencer_rpc_slot = Arc::new(std::sync::OnceLock::new());
         let mut p2p_runtime = None;
         if let Some(config) = self.p2p_config.take() {
@@ -793,7 +793,7 @@ where
                 prover_address: config.prover_address.clone(),
             });
 
-        // NOTE: jtcn 11: Start the restricted RPC server
+        // NOTE: jtcn 11: Start the redacted RPC server which requires auth headers
         Self::launch_redacted_rpc(
             self.redacted_rpc_config,
             &handle,
@@ -862,6 +862,9 @@ where
                 peer_tips,
                 status: role_status,
             };
+
+            // NOTE: jtcn 12: this is the function responsible for leader failover etc etc
+            // mentioned above.
             task_executor
                 .spawn_critical_task("zone-role-controller", run_role_controller(context, sinks));
 
@@ -1129,10 +1132,10 @@ where
             >,
         >,
 {
-    /// Start the Commonware network and the long-lived P2P event demultiplexer.
+    /// Start the Commonware network and the P2P event router.
     ///
-    /// Role-specific consumers are attached later by the role controller through the returned
-    /// [`EventSinks`]. Generic events and typed backfill ports are routed for the process lifetime.
+    /// Role tasks attach through the returned [`EventSinks`]. It also routes backfill requests and
+    /// responses.
     fn launch_p2p_network(
         config: P2pConfig,
         network_id: P2pNetworkId,
@@ -1143,6 +1146,7 @@ where
         tokio::sync::mpsc::Sender<zone_p2p::P2pCommand>,
         tokio::sync::mpsc::Sender<BackfillCommand>,
     )> {
+        // NOTE: jtcn 14: Starts P2P and returns the channels the node uses to talk to it.
         let handle = spawn_p2p(config, network_id)?;
         let zone_p2p::P2pHandleParts {
             shutdown: shutdown_token,
@@ -1154,6 +1158,7 @@ where
         } = handle.into_parts();
 
         let sinks = EventSinks::default();
+        // NOTE: jtcn 23: Sends each P2P event to the leader or follower task running right now.
         task_executor.spawn_critical_task(
             "zone-p2p-event-router",
             route_events_to_generations(events, sinks.clone()),

@@ -217,6 +217,7 @@ where
             consensus_context: None,
             subblock_fee_recipients: Default::default(),
         };
+        // NOTE: jtcn 40: Creates the Zone EVM that will run the L1 update and user transactions.
         let mut builder = self
             .evm_config
             .builder_for_next_block(&mut db, &parent_header, next_block_env_attributes)
@@ -234,6 +235,11 @@ where
             PayloadBuilderError::Internal(err.into())
         })?;
 
+        // NOTE: jtcn 44: Deposits here and user transfers below both use the TIP 403 policy from
+        // finalized L1 state.
+        // NOTE: jtcn 45: The EVM removes those L1 policy reads before saving Zone state and rejects
+        // any attempt to write them.
+        // Runs advanceTempo first to update the L1 checkpoint, enable tokens, and process deposits.
         // Execute advanceTempo system transaction — exactly one per zone block.
         builder
             .execute_transaction(build_advance_tempo_tx(prepared, chain_id))
@@ -253,6 +259,7 @@ where
         // the size budget
         // The block executor owns gas-capacity accounting.
         let pool_tx_size_budget = MAX_RLP_BLOCK_SIZE - BLOCK_SIZE_SAFETY_MARGIN;
+        // NOTE: jtcn 46: Runs valid user transactions after advanceTempo until the block is full.
         let raw_best_txs = self
             .pool
             .best_transactions_with_attributes(BestTransactionsAttributes::new(base_fee, None));
@@ -273,6 +280,8 @@ where
             return Ok(BuildOutcome::Cancelled);
         }
 
+        // NOTE: jtcn 47: Finalizes waiting withdrawals after user transactions. With no waiting
+        // withdrawals, the interval decides when to make an empty batch boundary.
         finalize_withdrawal_batch_if_needed(
             &mut builder,
             block_number,

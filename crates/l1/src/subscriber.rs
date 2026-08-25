@@ -558,6 +558,8 @@ impl L1Subscriber {
         );
 
         let start = std::time::Instant::now();
+        // NOTE: jtcn 32: Verifies receipts, pulls portal events, and clears cached TIP 403 values
+        // when their L1 policy changed.
         self.backfill(l1_provider, next_block, finalized).await?;
         self.subscriber_metrics
             .backfill_duration_seconds
@@ -583,6 +585,7 @@ impl L1Subscriber {
 
         // Subscribe before the initial sync so a head published while catching
         // up remains queued as another trigger.
+        // NOTE: jtcn 31: Syncs every missing finalized L1 block in order.
         next_block = self.sync_finalized_once(l1_provider, next_block).await?;
 
         while let Some(trigger) = triggers.next().await {
@@ -712,6 +715,8 @@ impl L1Subscriber {
                     })?;
                 }
             }
+            // NOTE: jtcn 33: Adds the verified L1 block to the Zone queue and wakes
+            // `ZoneEngine::run_until`.
             let appended = self
                 .deposit_queue
                 .try_enqueue_sealed(sealed, events.clone())
@@ -764,12 +769,15 @@ impl L1Subscriber {
     /// [`Self::spawn`] retries transient errors and treats deterministic finalized-block
     /// ingestion failures as fatal.
     pub async fn run(&self) -> eyre::Result<()> {
+        // NOTE: jtcn 29: Reads finalized L1 blocks in order so every node sees the same deposits
+        // and config before handling the matching Zone block.
         let provider = self.connect().await?;
         let triggers = self.head_triggers(&provider).await?;
         info!(
             portal = %self.config.portal_address,
             "Following finalized L1 blocks"
         );
+        // NOTE: jtcn 30: Uses L1 head notifications to check for newly finalized blocks.
         self.follow_finalized(&provider, triggers).await
     }
 

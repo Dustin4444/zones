@@ -325,6 +325,10 @@ async fn join_runtime_thread(thread: std::thread::JoinHandle<()>) -> eyre::Resul
 
 /// Starts Commonware block transport on a dedicated OS thread.
 pub fn spawn_p2p(config: P2pConfig, network_id: P2pNetworkId) -> eyre::Result<P2pHandle> {
+    // NOTE: jtcn 15: Runs P2P on its own thread. Commands send blocks, transactions, and settlement
+    // messages from the node to peers, while events bring received messages back to the node.
+    // Backfill commands ask for missing blocks or send blocks to a peer. Backfill requests tell the
+    // node what a peer needs, and backfill responses return missing blocks to the follower.
     let shutdown = CancellationToken::new();
     let thread_shutdown = shutdown.clone();
     let (stopped_tx, stopped) = oneshot::channel();
@@ -337,6 +341,7 @@ pub fn spawn_p2p(config: P2pConfig, network_id: P2pNetworkId) -> eyre::Result<P2
     let thread = std::thread::Builder::new()
         .name("zone-p2p".to_owned())
         .spawn(move || {
+            // NOTE: jtcn 16: Starts the Commonware runtime for this Zone using the channels above.
             let result = run(
                 config,
                 network_id,
@@ -385,6 +390,10 @@ fn run(
     commonware_runtime::tokio::Runner::new(runtime_config).start(|context| async move {
         let local_ed25519_public_key = config.ed25519_public_key();
         let leadership = config.leadership();
+        // NOTE: jtcn 17: Builds a network name from the protocol, L1, portal, and Zone ID, then
+        // loads the peers trusted by the manifest.
+        // NOTE: jtcn 18: RPC nodes connect to quorum nodes. Quorum nodes do not connect back to
+        // RPC nodes.
         let (mut commonware, mut oracle, peers) = network::instantiate(
             &context,
             &config.manifest,
@@ -395,6 +404,8 @@ fn run(
             network_id,
         )?;
         oracle.track(0, peers);
+        // NOTE: jtcn 19: Creates separate P2P channels for blocks, backfill, transactions, and
+        // settlement messages.
         let (block_sender, block_receiver) =
             commonware.register(BLOCK_CHANNEL, network::block_quota(), BLOCK_BACKLOG);
         let (settlement_proposal_sender, settlement_proposal_receiver) = commonware.register(
@@ -449,8 +460,12 @@ fn run(
             })
             .await;
 
+        // NOTE: jtcn 20: The manifest says who is a member. The current L1 schedule says who can
+        // send each type of P2P message.
         let membership = RoutingMembership::from_manifest(&config.manifest);
 
+        // NOTE: jtcn 21: Checks those permissions before sending blocks, transactions, or
+        // settlement messages to peers.
         let command_loop = run_commands(
             local_ed25519_public_key.clone(),
             membership.clone(),
@@ -465,6 +480,7 @@ fn run(
         );
         tokio::pin!(command_loop);
 
+        // NOTE: jtcn 22: Verifies who sent each received message and whether they can send it now.
         let receive_loop = run_receivers(
             local_ed25519_public_key.clone(),
             membership.clone(),

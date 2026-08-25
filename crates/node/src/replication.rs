@@ -342,6 +342,8 @@ where
                 "persisted zone block hash does not match notification at height {number}: expected={expected}, actual={hash}"
             );
         }
+        // NOTE: jtcn 51: Sends each saved Zone block to the P2P runtime for broadcast.
+        // NOTE: jtcn 52: The P2P runtime checks permission, then sends it to every manifest peer.
         commands
             .send(P2pCommand::BroadcastBlock(block.encoded))
             .await
@@ -637,6 +639,8 @@ where
         signed.attestation == expected,
         "settlement signature does not match leader state"
     );
+    // NOTE: jtcn 71: Verifies and saves each follower signature. `BatchSubmitter::submit_batch`
+    // waits here until it has enough.
     let signatures =
         store.insert_follower_settlement(attestation.domain, leader, signer, signed)?;
     Ok((height, signer, signatures))
@@ -826,6 +830,8 @@ pub(crate) async fn run_follower_block_sync<P>(
                                 height <= persisted_head,
                                 "settlement proposal at height {height} is not durable; persisted head is {persisted_head}"
                             );
+                            // NOTE: jtcn 69: The follower rebuilds the batch from its own saved
+                            // Zone state and signs only if it matches exactly.
                             let expected = build_settlement_attestation(
                                 &provider,
                                 height,
@@ -848,6 +854,8 @@ pub(crate) async fn run_follower_block_sync<P>(
                             // Return the signed settlement attestation to the peer that
                             // proposed it. During a scheduled handoff that is the outgoing
                             // leader, not the most recently observed one.
+                            // NOTE: jtcn 70: Sends the signature back to
+                            // `collect_follower_settlement_signatures` on the leader.
                             commands.send(P2pCommand::SendSettlementSignature {
                                 leader: leader.clone(),
                                 signature: signed.encode(),
@@ -862,6 +870,7 @@ pub(crate) async fn run_follower_block_sync<P>(
                         }
                     }
                     P2pEvent::BlockReceived { .. } => {
+                        // NOTE: jtcn 53: Passes a received peer block into the follower import path.
                         let (block, live_sender) = match event {
                             P2pEvent::BlockReceived { leader_ed25519_public_key, block } => {
                                 (block, Some(leader_ed25519_public_key))
@@ -1008,8 +1017,14 @@ where
         tracing::warn!(target: "zone::p2p", dropped, pending_limit = MAX_PENDING_BLOCKS, "Dropped far-future peer block because the pending block buffer is full");
     }
     if number > best.saturating_add(1) {
+        // NOTE: jtcn 54: If a new block skips a height, holds it and asks a peer for the missing
+        // saved blocks first.
+        // NOTE: jtcn 55: The retry loop asks eligible peers for those saved blocks. Any node can
+        // serve them whether it is leader or follower.
         info!(target: "zone::p2p", local_head = best, received = number, "Detected zone block gap; requesting backfill");
     }
+    // NOTE: jtcn 56: Imports held and backfilled blocks in order so each one extends the current
+    // Zone chain.
     match drain_pending_blocks(
         provider,
         engine,
@@ -1071,6 +1086,8 @@ where
         let Some(block) = pending.remove(&next) else {
             return Ok(PeerBlockImportOutcome::Imported);
         };
+        // NOTE: jtcn 57: Checks the height, parent, scheduled leader, L1 checkpoint, L1 events,
+        // and transaction results before import.
         import_peer_block(
             provider,
             engine,
@@ -1223,6 +1240,7 @@ where
         );
     }
 
+    // NOTE: jtcn 58: After validation, accepts the block and marks its L1 block as processed.
     // Mirror the leader engine only after the block is canonical locally. The block cannot be
     // un-imported at this point, so the observation must be released unconditionally — leaving it
     // behind would stall the subscriber once the lookahead window fills. Advancing the queue is

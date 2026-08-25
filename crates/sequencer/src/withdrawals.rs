@@ -387,6 +387,8 @@ impl WithdrawalProcessor {
     pub async fn run(&self, shutdown: &sync::CancellationToken) {
         info!("Withdrawal processor started");
 
+        // NOTE: jtcn 76: A submitted batch wakes this worker immediately. The poll interval only
+        // retries if the wake up was missed or earlier work failed.
         loop {
             tokio::select! {
                 biased;
@@ -402,6 +404,8 @@ impl WithdrawalProcessor {
                 }
             }
 
+            // NOTE: jtcn 77: Matches each portal queue hash with the full withdrawals saved when
+            // the Zone batch was accepted.
             if let Err(e) = self.process_queue(shutdown).await {
                 error!(error = %e, "Withdrawal processing cycle failed");
             }
@@ -546,6 +550,8 @@ impl WithdrawalProcessor {
                 return Ok(());
             }
 
+            // NOTE: jtcn 78: Compares the queue hash with the saved withdrawals so a retry skips
+            // ones the portal already processed.
             let Some(offset) = find_processed_offset(&withdrawals, slot_hash) else {
                 error!(
                     slot = head_val,
@@ -578,6 +584,8 @@ impl WithdrawalProcessor {
                 return Ok(());
             }
 
+            // NOTE: jtcn 79: Splits the remaining withdrawals into L1 transactions that fit the
+            // configured gas limit.
             let batches =
                 build_withdrawal_batches(remaining, self.config.batch_limits.max_batch_gas);
             let total_gas = batches
@@ -594,6 +602,8 @@ impl WithdrawalProcessor {
             if shutdown.is_cancelled() {
                 return Ok(());
             }
+            // NOTE: jtcn 80: Submits those transactions with ordered nonces and limits how many
+            // can be in flight at once.
             let outcome = self
                 .submit_and_confirm_batches(
                     SubmitBatches {
@@ -611,6 +621,10 @@ impl WithdrawalProcessor {
 
             match outcome {
                 SubmitOutcome::Confirmed => {
+                    // NOTE: jtcn 81: After every transaction for this slot confirms, removes its
+                    // saved data and moves to the next slot.
+                    // NOTE: jtcn 82: Repeats with the next slot and stops when the portal queue is
+                    // empty. The portal side starts at `ZonePortal.setSequencerSet`.
                     self.store.lock().remove_batch(head_val);
                     info!(
                         slot = head_val,
