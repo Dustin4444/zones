@@ -83,7 +83,7 @@ pub(crate) use auth_tokens::{
     build_signed_token_blob, now_secs, sign_keychain_signature, sign_p256_signature,
     sign_webauthn_signature,
 };
-pub(crate) use network::TcpChaosProxy;
+pub(crate) use network::{P2pChaosNetwork, TcpChaosProxy};
 
 /// Atomic counter for unique zone IDs across concurrent tests.
 static NEXT_ZONE_ID: AtomicU64 = AtomicU64::new(71_000);
@@ -3851,9 +3851,10 @@ pub(crate) async fn start_real_p2p_cluster_with_active_nodes(
         active_nodes,
         L1ProxyMode::Direct,
         None,
+        false,
     )
     .await?
-    .0)
+    .cluster)
 }
 
 /// Start the full three-member real-L1 cluster with one shared, controllable L1 proxy. Existing
@@ -3862,16 +3863,18 @@ pub(crate) async fn start_real_p2p_cluster_with_l1_proxy(
     withdrawal_batch_interval_blocks: u64,
     l1_block_time: Duration,
 ) -> eyre::Result<(RealP2pCluster, TcpChaosProxy)> {
-    let (cluster, mut proxies) = start_real_p2p_cluster_inner(
+    let mut parts = start_real_p2p_cluster_inner(
         withdrawal_batch_interval_blocks,
         3,
         L1ProxyMode::All,
         Some(l1_block_time),
+        false,
     )
     .await?;
     Ok((
-        cluster,
-        proxies
+        parts.cluster,
+        parts
+            .l1_proxies
             .pop()
             .expect("proxied cluster constructor must return its L1 proxy"),
     ))
@@ -3882,17 +3885,46 @@ pub(crate) async fn start_real_p2p_cluster_with_per_node_l1_proxies(
     withdrawal_batch_interval_blocks: u64,
     l1_block_time: Duration,
 ) -> eyre::Result<(RealP2pCluster, [TcpChaosProxy; 3])> {
-    let (cluster, proxies) = start_real_p2p_cluster_inner(
+    let parts = start_real_p2p_cluster_inner(
         withdrawal_batch_interval_blocks,
         3,
         L1ProxyMode::PerNode,
         Some(l1_block_time),
+        false,
     )
     .await?;
-    let proxies: [TcpChaosProxy; 3] = proxies
+    let proxies: [TcpChaosProxy; 3] = parts
+        .l1_proxies
         .try_into()
         .map_err(|_| eyre::eyre!("per-node proxy constructor must return three L1 proxies"))?;
-    Ok((cluster, proxies))
+    Ok((parts.cluster, proxies))
+}
+
+/// Start a full three-member cluster with independently controllable P2P links and one
+/// controllable L1 proxy per node.
+pub(crate) async fn start_real_p2p_network_chaos_cluster(
+    withdrawal_batch_interval_blocks: u64,
+    l1_block_time: Duration,
+) -> eyre::Result<(RealP2pCluster, P2pChaosNetwork, [TcpChaosProxy; 3])> {
+    let parts = start_real_p2p_cluster_inner(
+        withdrawal_batch_interval_blocks,
+        3,
+        L1ProxyMode::PerNode,
+        Some(l1_block_time),
+        true,
+    )
+    .await?;
+    let proxies = parts
+        .l1_proxies
+        .try_into()
+        .map_err(|_| eyre::eyre!("network-chaos cluster must return three L1 proxies"))?;
+    Ok((
+        parts.cluster,
+        parts
+            .p2p_network
+            .expect("network-chaos cluster must return its P2P proxy mesh"),
+        proxies,
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -3902,12 +3934,19 @@ enum L1ProxyMode {
     PerNode,
 }
 
+struct RealP2pClusterParts {
+    cluster: RealP2pCluster,
+    l1_proxies: Vec<TcpChaosProxy>,
+    p2p_network: Option<P2pChaosNetwork>,
+}
+
 async fn start_real_p2p_cluster_inner(
     withdrawal_batch_interval_blocks: u64,
     active_nodes: usize,
     proxy_mode: L1ProxyMode,
     l1_block_time: Option<Duration>,
-) -> eyre::Result<(RealP2pCluster, Vec<TcpChaosProxy>)> {
+    proxy_p2p: bool,
+) -> eyre::Result<RealP2pClusterParts> {
     eyre::ensure!(
         (2..=3).contains(&active_nodes),
         "real P2P test cluster requires two or three active nodes, got {active_nodes}"
@@ -3950,6 +3989,12 @@ async fn start_real_p2p_cluster_inner(
         available_address()?,
         available_address()?,
     ];
+    let (p2p_network, manifest_addresses) = if proxy_p2p {
+        let (network, manifest_addresses) = P2pChaosNetwork::start(addresses).await?;
+        (Some(network), manifest_addresses)
+    } else {
+        (None, [addresses; 3])
+    };
     let identities = [
         Ed25519PrivateKey::from_seed(301),
         Ed25519PrivateKey::from_seed(302),
@@ -3998,27 +4043,24 @@ async fn start_real_p2p_cluster_inner(
         next_unique_chain_id()
     ));
     std::fs::create_dir_all(&config_dir)?;
-    let manifest_path = config_dir.join("manifest.toml");
-    let mut manifest = format!(
-        "zone_id = {zone_id}\nsequencer_set_version = 0\nleader_ed25519_public_key = \"{}\"\n",
-        const_hex::encode_prefixed(public_keys[0].as_ref())
-    );
-    for (index, ((public_key, signer), address)) in public_keys
-        .iter()
-        .zip(&attestation_signers)
-        .zip(addresses)
-        .enumerate()
-    {
-        manifest.push_str(&format!(
-            "\n[[nodes]]\nname = \"node-{index}\"\ned25519_public_key = \"{}\"\nsecp256k1_address = \"{}\"\naddress = \"{address}\"\n",
-            const_hex::encode_prefixed(public_key.as_ref()),
-            signer.address(),
-        ));
-    }
-    std::fs::write(&manifest_path, manifest)?;
-
     let mut configs = Vec::with_capacity(3);
     for (index, role) in [(0, Role::Leader), (1, Role::Follower), (2, Role::Follower)] {
+        let manifest_path = config_dir.join(format!("manifest-{index}.toml"));
+        let mut manifest = format!(
+            "zone_id = {zone_id}\nsequencer_set_version = 0\nleader_ed25519_public_key = \"{}\"\n",
+            const_hex::encode_prefixed(public_keys[0].as_ref())
+        );
+        for (peer_index, (public_key, signer)) in
+            public_keys.iter().zip(&attestation_signers).enumerate()
+        {
+            let address = manifest_addresses[index][peer_index];
+            manifest.push_str(&format!(
+                "\n[[nodes]]\nname = \"node-{peer_index}\"\ned25519_public_key = \"{}\"\nsecp256k1_address = \"{}\"\naddress = \"{address}\"\n",
+                const_hex::encode_prefixed(public_key.as_ref()),
+                signer.address(),
+            ));
+        }
+        std::fs::write(&manifest_path, manifest)?;
         let key_path = config_dir.join(format!("node-{index}.key"));
         std::fs::write(
             &key_path,
@@ -4061,15 +4103,16 @@ async fn start_real_p2p_cluster_inner(
         );
     }
 
-    Ok((
-        RealP2pCluster {
+    Ok(RealP2pClusterParts {
+        cluster: RealP2pCluster {
             l1,
             portal_address,
             nodes,
             attestation_signers: attestation_signers.to_vec(),
         },
         l1_proxies,
-    ))
+        p2p_network,
+    })
 }
 
 /// Start a three-node multi-sequencer cluster with identical genesis state and authenticated
