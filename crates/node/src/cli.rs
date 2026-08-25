@@ -115,37 +115,7 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
         let zone_id = builder.config().chain.zone_id();
         validate_deprecated_zone_id(args.zone_id, zone_id)?;
 
-        let p2p_config = args
-            .sequencer_manifest
-            .as_ref()
-            .map(|manifest_path| {
-                let ed25519_key_path = args.p2p_key.as_ref().ok_or_else(|| {
-                    eyre::eyre!("--p2p.key is required with --sequencer.manifest")
-                })?;
-                // Required for a quorum member and rejected for an `rpc_only` node, which never
-                // signs a settlement attestation; the manifest decides which this node is.
-                P2pConfig::load(
-                    manifest_path,
-                    ed25519_key_path,
-                    args.secp256k1_key.as_ref(),
-                    args.p2p_listen,
-                    args.p2p_bypass_ip_check,
-                    zone_id,
-                    args.sequencer_role,
-                )
-            })
-            .transpose()?;
-        if let Some(config) = p2p_config.as_ref() {
-            info!(
-                target: "reth::cli",
-                ed25519_public_key = %config.ed25519_public_key(),
-                secp256k1_address = ?config.secp256k1_address(),
-                listen = %config.listen(),
-                "Validated multi-sequencer manifest and local identity"
-            );
-        }
-
-        let manifest_mode = p2p_config.is_some();
+        let manifest_mode = args.sequencer_manifest.is_some();
         validate_p2p_transaction_size_limit(
             manifest_mode,
             builder.config().txpool.max_tx_input_bytes,
@@ -156,28 +126,6 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
             builder.config_mut().engine.persistence_threshold = 0;
             builder.config_mut().engine.memory_block_buffer_target = Some(0);
         }
-        // Every promotable node constructs all the sequencer resources: activation is gated at
-        // runtime by the leadership schedule, so a quorum follower must be able to become a
-        // leader without a restart. An rpc-only standby is not promotable at runtime — that
-        // needs a new individual key registered with `ZonePortal` and a manifest change — so it
-        // is deliberately left without the shared sequencer key, which is also the zone's ECIES
-        // private key for encrypted deposits and must not sit on an internet-facing host.
-        let rpc_only = p2p_config.as_ref().is_some_and(P2pConfig::is_rpc_only);
-        let should_sequence_blocks = sequencer_enabled(args.enable_sequencer, p2p_config.as_ref());
-        if rpc_only && args.sequencer_key_file.is_some() {
-            return Err(eyre::eyre!(
-                "this node is `rpc_only` in the manifest, so --sequencer-key-file must not be provided: the shared key is never used here and is also the zone ECIES private key for encrypted deposits"
-            ));
-        }
-        let sequencer_signer = if should_sequence_blocks {
-            Some(load_sequencer_signer(args.sequencer_key_file.as_deref()).await?)
-        } else {
-            None
-        };
-        eyre::ensure!(
-            !args.enable_prover || should_sequence_blocks,
-            "--sequencer.enable-prover requires a promotable sequencer node"
-        );
         let additional_decryption_keys =
             load_decryption_keys(args.deposit_decryption_keys_file.as_deref()).await?;
 
@@ -194,7 +142,7 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
         let checker_database_path = builder.config().datadir().data_dir().join("checker");
 
         let mut node = ZoneNode::new(
-            args.l1_rpc_url,
+            args.l1_rpc_url.clone(),
             args.portal_address,
             args.l1_fetch_concurrency,
             Duration::from_millis(args.l1_retry_connection_interval_ms),
@@ -211,32 +159,7 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
             node = node.with_deposit_decryption_keys(additional_decryption_keys);
         }
 
-        if should_sequence_blocks {
-            let sequencer_signer = sequencer_signer
-                .expect("sequencer signer is parsed whenever sequencing is enabled");
-            // `None` on an rpc-only node: it holds no individual key, and it is never the
-            // scheduled leader, so it never submits an L1 settlement transaction.
-            let l1_transaction_signer = p2p_config
-                .as_ref()
-                .and_then(P2pConfig::block_attestation_signer);
-            node = node.with_sequencer(ZoneSequencerAddOnsConfig {
-                sequencer_signer,
-                l1_transaction_signer,
-                zone_id,
-                zone_poll_interval: Duration::from_secs(args.zone_poll_interval_secs),
-                batch_anchor_config: BatchAnchorConfig::default(),
-                withdrawal_poll_interval: Duration::from_secs(args.withdrawal_poll_interval_secs),
-                withdrawal_batch_limits: WithdrawalBatchLimits {
-                    max_batch_gas: args.withdrawal_max_batch_gas,
-                    max_in_flight_batches: args.withdrawal_max_in_flight_batches,
-                },
-                enable_prover: args.enable_prover,
-                prover_address: args.prover_address,
-            });
-        }
-        if let Some(config) = p2p_config {
-            node = node.with_p2p(config);
-        }
+        node = configure_sequencing(&args, zone_id, node).await?;
         let checker_l1_block_tracker = node.l1_block_tracker();
 
         // Install or skip the checker ExEx based on the configured mode.
@@ -268,6 +191,82 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
             }
         }
     })
+}
+
+/// Load and attach all sequencer resources to the node.
+async fn configure_sequencing(
+    args: &ZoneArgs,
+    zone_id: u32,
+    mut node: ZoneNode,
+) -> eyre::Result<ZoneNode> {
+    let p2p_config =
+        args.sequencer_manifest
+            .as_ref()
+            .map(|manifest_path| {
+                let ed25519_key_path = args.p2p_key.as_ref().ok_or_else(|| {
+                    eyre::eyre!("--p2p.key is required with --sequencer.manifest")
+                })?;
+                P2pConfig::load(
+                    manifest_path,
+                    ed25519_key_path,
+                    args.secp256k1_key.as_ref(),
+                    args.p2p_listen,
+                    args.p2p_bypass_ip_check,
+                    zone_id,
+                    args.sequencer_role,
+                )
+            })
+            .transpose()?;
+    if let Some(config) = p2p_config.as_ref() {
+        info!(
+            target: "reth::cli",
+            ed25519_public_key = %config.ed25519_public_key(),
+            secp256k1_address = ?config.secp256k1_address(),
+            listen = %config.listen(),
+            "Validated multi-sequencer manifest and local identity"
+        );
+    }
+
+    let rpc_only = p2p_config.as_ref().is_some_and(P2pConfig::is_rpc_only);
+    let should_sequence_blocks = args.enable_sequencer
+        || p2p_config
+            .as_ref()
+            .is_some_and(|config| !config.is_rpc_only());
+    if rpc_only && args.sequencer_key_file.is_some() {
+        return Err(eyre::eyre!(
+            "this node is `rpc_only` in the manifest, so --sequencer-key-file must not be provided: the shared key is never used here and is also the zone ECIES private key for encrypted deposits"
+        ));
+    }
+    eyre::ensure!(
+        !args.enable_prover || should_sequence_blocks,
+        "--sequencer.enable-prover requires a promotable sequencer node"
+    );
+
+    if should_sequence_blocks {
+        let sequencer_signer = load_sequencer_signer(args.sequencer_key_file.as_deref()).await?;
+        node = node.with_sequencer(ZoneSequencerAddOnsConfig {
+            sequencer_signer,
+            // `None` on an rpc-only node: it holds no individual key, and it is never the
+            // scheduled leader, so it never submits an L1 settlement transaction.
+            l1_transaction_signer: p2p_config
+                .as_ref()
+                .and_then(P2pConfig::block_attestation_signer),
+            zone_id,
+            zone_poll_interval: Duration::from_secs(args.zone_poll_interval_secs),
+            batch_anchor_config: BatchAnchorConfig::default(),
+            withdrawal_poll_interval: Duration::from_secs(args.withdrawal_poll_interval_secs),
+            withdrawal_batch_limits: WithdrawalBatchLimits {
+                max_batch_gas: args.withdrawal_max_batch_gas,
+                max_in_flight_batches: args.withdrawal_max_in_flight_batches,
+            },
+            enable_prover: args.enable_prover,
+            prover_address: args.prover_address.clone(),
+        });
+    }
+    if let Some(config) = p2p_config {
+        node = node.with_p2p(config);
+    }
+    Ok(node)
 }
 
 async fn load_sequencer_signer(
@@ -546,14 +545,6 @@ fn prepend_log_filter(filter: &mut String, directives: &str) {
     }
 }
 
-/// Whether the sequencer add-on is configured at boot.
-///
-/// `rpc_only` nodes are excluded: they never produce blocks and cannot be promoted without a
-/// restart, so they must not be given the shared sequencer key.
-fn sequencer_enabled(cli_flag: bool, p2p_config: Option<&P2pConfig>) -> bool {
-    cli_flag || p2p_config.is_some_and(|config| !config.is_rpc_only())
-}
-
 fn validate_p2p_transaction_size_limit(
     manifest_mode: bool,
     max_tx_input_bytes: usize,
@@ -604,7 +595,7 @@ mod tests {
     use clap::Parser as _;
 
     use super::{
-        Role, ZoneArgs, ZoneCli, load_decryption_keys, load_sequencer_signer, sequencer_enabled,
+        Role, ZoneArgs, ZoneCli, load_decryption_keys, load_sequencer_signer,
         validate_deprecated_zone_id, validate_l1_rpc_url, validate_p2p_transaction_size_limit,
         validate_portal_address,
     };
@@ -992,15 +983,6 @@ mod tests {
         ]))
         .unwrap();
         assert!(enabled.zone.p2p_bypass_ip_check);
-    }
-
-    #[test]
-    fn sequencer_resources_follow_the_cli_flag_without_a_manifest() {
-        // Manifest mode is covered by `sequencer_enabled`'s other arm, which needs a real
-        // `P2pConfig`; see `manifest_mode_configures_sequencer_resources_except_on_standbys`
-        // in the integration tests.
-        assert!(sequencer_enabled(true, None));
-        assert!(!sequencer_enabled(false, None));
     }
 
     #[test]
