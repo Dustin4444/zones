@@ -122,14 +122,14 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
             manifest_mode,
             builder.config().txpool.max_tx_input_bytes,
         )?;
+
+
+        // NOTE: jtcn 2: Nodes started with a P2P manifest are configured to write each accepted block
+        // to disk immediately instead of keeping it only in memory.
         if manifest_mode {
-            // Replicate only durable blocks. Persist every block immediately so followers can
-            // acknowledge each block without waiting for Reth's in-memory buffer to fill.
             builder.config_mut().engine.persistence_threshold = 0;
             builder.config_mut().engine.memory_block_buffer_target = Some(0);
         }
-        let additional_decryption_keys =
-            load_decryption_keys(args.deposit_decryption_keys_file.as_deref()).await?;
 
         builder.config_mut().network.discovery.disable_discovery = true;
         builder.config_mut().rpc.disable_auth_server = true;
@@ -150,9 +150,14 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
                 args.redacted_rpc_max_auth_token_validity_secs,
             ),
         });
-        if !additional_decryption_keys.is_empty() {
-            node = node.with_deposit_decryption_keys(additional_decryption_keys);
+
+        // NOTE: jtcn 3: Loads extra decryption keys from an operator-configured file. After a
+        // key rotation, deposits can use an old key for 86,400 blocks (about one day), so retain it.
+        if let Some(path) = args.deposit_decryption_keys_file.as_deref() {
+            let keys = load_decryption_keys(Some(path)).await?;
+            node = node.with_deposit_decryption_keys(keys);
         }
+
 
         node = configure_sequencing(&args, zone_id, node).await?;
 
@@ -167,9 +172,6 @@ async fn configure_sequencing(
     zone_id: u32,
     mut node: ZoneNode,
 ) -> eyre::Result<ZoneNode> {
-    // NOTE: jtcn 2: the node is initialized with a p2p config which enables peering
-    // transactions and blocks via commonware p2p. All nodes need this including
-    // sequencers (leader/followers) as well as rpc nodes. More on this later.
     let p2p_config =
         args.sequencer_manifest
             .as_ref()
