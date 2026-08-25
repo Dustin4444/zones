@@ -13716,6 +13716,53 @@ dependencies = [
 ]
 
 [[package]]
+name = "zone-checker"
+version = "0.2.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-contract",
+ "alloy-eips",
+ "alloy-network",
+ "alloy-primitives",
+ "alloy-provider",
+ "alloy-rlp",
+ "alloy-rpc-client",
+ "alloy-rpc-types-eth",
+ "alloy-sol-types",
+ "alloy-transport",
+ "bincode",
+ "bytes",
+ "eyre",
+ "futures",
+ "metrics",
+ "reth-chainspec",
+ "reth-codecs",
+ "reth-db",
+ "reth-ethereum-primitives",
+ "reth-exex",
+ "reth-metrics",
+ "reth-node-api",
+ "reth-primitives-traits",
+ "reth-provider",
+ "reth-storage-api",
+ "serde",
+ "tempfile",
+ "tempo-alloy",
+ "tempo-chainspec",
+ "tempo-contracts",
+ "tempo-precompiles",
+ "tempo-primitives",
+ "tempo-revm",
+ "tempo-zone-contracts",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "zone-l1",
+ "zone-precompiles",
+ "zone-primitives",
+]
+
+[[package]]
 name = "zone-evm"
 version = "0.2.0"
 dependencies = [
@@ -13880,6 +13927,7 @@ dependencies = [
  "vergen-git2",
  "zeroize",
  "zone-chainspec",
+ "zone-checker",
  "zone-evm",
  "zone-l1",
  "zone-node",
