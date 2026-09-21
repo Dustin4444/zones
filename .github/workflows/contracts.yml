@@ -60,7 +60,7 @@ jobs:
 
       - name: Build Solidity artifacts
         working-directory: crates/contracts
-        run: forge build --sizes
+        run: forge build --skip test
 
       - name: Check Solidity and Rust ABIs
         run: cargo run -p tempo-xtask -- check-abi
@@ -107,7 +107,17 @@ jobs:
 
       - name: Run Forge build
         working-directory: crates/contracts
-        run: forge build --sizes
+        run: forge build --skip test
+
+      # Exclude all test helpers too: their imports would pull the runtimes back in. Protocol-
+      # installed runtimes have a separate 64 KiB budget in PortalRuntime.t.sol.
+      - name: Check sizes of normally deployed contracts
+        working-directory: crates/contracts
+        run: |
+          forge build --sizes --skip 'test/**' \
+            src/runtime/tempo/ZonePortal.sol \
+            src/runtime/tempo/ZoneMessenger.sol \
+            src/runtime/tempo/Verifier.sol
 
   lint:
     permissions:
@@ -224,6 +234,17 @@ jobs:
             crates/contracts/cache
             crates/contracts/out
           key: tempo-forge-specs-v1-${{ runner.os }}-${{ steps.foundry-ref.outputs.sha }}-${{ env.TEMPO_FOUNDRY_REF }}-${{ steps.contracts-key.outputs.tree }}
+
+      - name: Build and check deployment sizes with Tempo-capable Forge
+        working-directory: crates/contracts
+        run: |
+          "$GITHUB_WORKSPACE/foundry/target/release/forge" build --skip test
+          # Protocol-installed runtimes are excluded here and have a separate 64 KiB budget in
+          # PortalRuntime.t.sol.
+          "$GITHUB_WORKSPACE/foundry/target/release/forge" build --sizes --skip 'test/**' \
+            src/runtime/tempo/ZonePortal.sol \
+            src/runtime/tempo/ZoneMessenger.sol \
+            src/runtime/tempo/Verifier.sol
 
       - name: Run Forge tests (zone specs)
         working-directory: crates/contracts
